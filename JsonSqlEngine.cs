@@ -16,11 +16,11 @@ namespace DSO.Core.JsonSqlEngine
     public class JsonSqlEngineQueryDto
     {
         /// <summary>Sunucu belirler. JSON'dan gelmez.</summary>
-        //[JsonIgnore]
+        [JsonIgnore]
         public string TableName { get; set; } = string.Empty;
 
         /// <summary>Sunucu belirler. JSON'dan gelmez. Boşsa *.</summary>
-        //[JsonIgnore]
+        [JsonIgnore]
         public List<string> Colums { get; set; } = new() { "*" };
 
         /// <summary>
@@ -49,7 +49,7 @@ namespace DSO.Core.JsonSqlEngine
     /// <summary>Tek koşul: { operator, value, func, defaultValue }</summary>
     public class FilterCondition
     {
-        /// <summary>= != &gt; &lt; &gt;= &lt;= contains startswith endswith between in notin isnull isnotnull (equals, notequals, &lt;&gt; da olur)</summary>
+        /// <summary>= != &gt; &lt; &gt;= &lt;= contains notcontains startswith endswith between in notin isnull isnotnull (equals, notequals, &lt;&gt; da olur)</summary>
         public string? Operator { get; set; }
         public object? Value { get; set; }
 
@@ -109,7 +109,12 @@ namespace DSO.Core.JsonSqlEngine
 
         private static readonly Dictionary<string, string> CompareOps = new(StringComparer.Ordinal)
         {
-            ["="] = "=", ["!="] = "<>", [">"] = ">", ["<"] = "<", [">="] = ">=", ["<="] = "<="
+            ["="] = "=",
+            ["!="] = "<>",
+            [">"] = ">",
+            ["<"] = "<",
+            [">="] = ">=",
+            ["<="] = "<="
         };
 
         private static readonly string[] DateFormats =
@@ -227,7 +232,8 @@ namespace DSO.Core.JsonSqlEngine
                         if (g.Length > 0) parts.Add("(" + g + ")");
                         continue;
                     }
-                    string f = BuildField(key, prop.Value, ctx);
+                    // "StokAdi|StokKod": aynı koşul alanlardan herhangi birinde (VEYA)
+                    string f = key.IndexOf('|') >= 0 ? BuildMultiField(key, prop.Value, ctx) : BuildField(key, prop.Value, ctx);
                     if (f.Length > 0) parts.Add(f);
                 }
             }
@@ -237,6 +243,19 @@ namespace DSO.Core.JsonSqlEngine
             }
 
             return string.Join(" " + logic + " ", parts);
+        }
+
+        private string BuildMultiField(string key, JsonElement value, Context ctx)
+        {
+            var parts = new List<string>();
+            foreach (var name in key.Split('|'))
+            {
+                if (name.Trim().Length == 0) continue;
+                string s = BuildField(name.Trim(), value, ctx);
+                if (s.Length > 0) parts.Add(s);
+            }
+            if (parts.Count == 0) return string.Empty;
+            return parts.Count == 1 ? parts[0] : "(" + string.Join(" OR ", parts) + ")";
         }
 
         private string BuildField(string key, JsonElement value, Context ctx)
@@ -313,14 +332,15 @@ namespace DSO.Core.JsonSqlEngine
             if (op == "in" || op == "notin")
                 return BuildIn(target, op == "in" ? "IN" : "NOT IN", value, ctx);
 
-            if (op == "contains" || op == "startswith" || op == "endswith")
+            if (op == "contains" || op == "notcontains" || op == "startswith" || op == "endswith")
             {
                 // metin olduğu gibi kullanılır (tarihe çevrilmez)
                 object? raw = value.ValueKind == JsonValueKind.String ? value.GetString() : ToValue(value);
                 if (IsBlank(raw)) return string.Empty;
                 string text = EscapeLike(Convert.ToString(raw, CultureInfo.InvariantCulture) ?? string.Empty);
-                string pattern = op == "contains" ? "%" + text + "%" : op == "startswith" ? text + "%" : "%" + text;
-                return $"{target} LIKE {AddParam(ctx, pattern)} ESCAPE '\\'";
+                string pattern = op == "contains" || op == "notcontains" ? "%" + text + "%" : op == "startswith" ? text + "%" : "%" + text;
+                // NOT LIKE: boş (NULL) alanlar SQL'de olduğu gibi gelmez; gelsin istenirse func: isnull
+                return $"{target} {(op == "notcontains" ? "NOT LIKE" : "LIKE")} {AddParam(ctx, pattern)} ESCAPE '\\'";
             }
 
             // = != > < >= <=
@@ -373,6 +393,7 @@ namespace DSO.Core.JsonSqlEngine
                 case ">=":
                 case "<=":
                 case "contains":
+                case "notcontains":
                 case "startswith":
                 case "endswith":
                 case "between":
