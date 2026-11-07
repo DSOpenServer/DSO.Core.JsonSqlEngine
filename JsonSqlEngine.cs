@@ -44,6 +44,12 @@ namespace DSO.Core.JsonSqlEngine
 
         /// <summary>Alan → 1 artan, 2 azalan. Ekleme sırası öncelik sırasıdır.</summary>
         public Dictionary<string, int> OrderBy { get; set; } = new();
+
+        /// <summary>Genel toplamlar: alan → sum | avg | count | min | max. Doluysa TotalsQuery üretilir.</summary>
+        public Dictionary<string, string>? Aggregates { get; set; }
+
+        /// <summary>Alanın farklı değerleri (başlık filtresi menüsü). Doluysa DistinctQuery ve DistinctCountQuery üretilir.</summary>
+        public string? Distinct { get; set; }
     }
 
     /// <summary>Tek koşul: { operator, value, func, defaultValue }</summary>
@@ -64,6 +70,22 @@ namespace DSO.Core.JsonSqlEngine
     {
         public string CountQuery { get; set; } = string.Empty;
         public string DataQuery { get; set; } = string.Empty;
+
+        /// <summary>
+        /// Aggregates verildiyse tek satırlık toplam sorgusu (aynı WHERE): SELECT SUM([Bakiye]) AS [Bakiye], ... FROM tablo WHERE ...;
+        /// Sütun adları Aggregates'in anahtarlarıdır; sonuç DataResult.Totals'a aynı adlarla yazılır. Yoksa boş.
+        /// </summary>
+        public string TotalsQuery { get; set; } = string.Empty;
+
+        /// <summary>
+        /// Distinct verildiyse: SELECT [Alan] AS [Value], COUNT(1) AS [Count] FROM tablo WHERE ... GROUP BY [Alan] ORDER BY [Alan]
+        /// (+ sayfalama). Sonuç DataResult.Data'ya [{ Value, Count }] olarak gider. Yoksa boş.
+        /// </summary>
+        public string DistinctQuery { get; set; } = string.Empty;
+
+        /// <summary>Distinct verildiyse farklı değer sayısı (TotalDataCount için). Yoksa boş.</summary>
+        public string DistinctCountQuery { get; set; } = string.Empty;
+
         public Dictionary<string, object?> Parameters { get; set; } = new();
     }
 
@@ -189,8 +211,48 @@ namespace DSO.Core.JsonSqlEngine
 
             data.Append(';');
             result.DataQuery = data.ToString();
+
+            // genel toplamlar: aynı koşullarla tek satır
+            if (dto.Aggregates != null && dto.Aggregates.Count > 0)
+            {
+                var parts = new List<string>();
+                foreach (var a in dto.Aggregates)
+                {
+                    var f = Field(a.Key);
+                    parts.Add(AggregateSql(a.Value, f.Sql, f.Name) + " AS " + Alias(f.Name));
+                }
+                result.TotalsQuery = $"SELECT {string.Join(", ", parts)} FROM {dto.TableName}{where};";
+            }
+
+            // farklı değerler: değere göre sıralı, sayılarıyla; sayfalama veri sorgusuyla aynı
+            if (!string.IsNullOrWhiteSpace(dto.Distinct))
+            {
+                var f = Field(dto.Distinct!);
+                var dq = new StringBuilder();
+                dq.Append($"SELECT {f.Sql} AS {Alias("Value")}, COUNT(1) AS {Alias("Count")} FROM {dto.TableName}{where} GROUP BY {f.Sql} ORDER BY {f.Sql}");
+                if (hasPaging) dq.Append(" OFFSET @p_sys_offset ROWS FETCH NEXT @p_sys_fetch ROWS ONLY");
+                dq.Append(';');
+                result.DistinctQuery = dq.ToString();
+                result.DistinctCountQuery = $"SELECT COUNT(1) FROM (SELECT {f.Sql} AS {Alias("Value")} FROM {dto.TableName}{where} GROUP BY {f.Sql}) AS d;";
+            }
             return result;
         }
+
+        /// <summary>Toplam türü → SQL. avg ve sum ondalıklı hesaplanır (tam sayı sütununda AVG yuvarlamasın, SUM taşmasın).</summary>
+        private static string AggregateSql(string? type, string fieldSql, string name)
+        {
+            switch ((type ?? string.Empty).Trim().ToLowerInvariant())
+            {
+                case "sum": return $"SUM(CAST({fieldSql} AS DECIMAL(38, 6)))";
+                case "avg": return $"AVG(CAST({fieldSql} AS DECIMAL(38, 6)))";
+                case "count": return $"COUNT({fieldSql})";
+                case "min": return $"MIN({fieldSql})";
+                case "max": return $"MAX({fieldSql})";
+                default: throw new NotSupportedException($"{name}: '{type}' toplamı desteklenmiyor (sum, avg, count, min, max).");
+            }
+        }
+
+        private string Alias(string name) => _options.QuoteFields ? "[" + name + "]" : name;
 
         private string BuildOrderBy(Dictionary<string, int>? orderBy)
         {
@@ -365,13 +427,22 @@ namespace DSO.Core.JsonSqlEngine
             {
                 items.Add(ToValue(value));
             }
+            // listede null: IN boş alanları da getirir ([Alan] IN (...) OR [Alan] IS NULL),
+            // NOT IN boş alanları getirmez (SQL'de NULL NOT IN (...) zaten sağlanmaz; burada açıkça yazılır)
+            bool hasNull = items.Any(x => x == null);
             items = items.Where(x => x != null).ToList();
 
-            // boş liste: IN hiçbir kaydı, NOT IN bütün kayıtları getirir
-            if (items.Count == 0) return sqlOp == "IN" ? "1 = 0" : "1 = 1";
+            if (items.Count == 0)
+            {
+                if (hasNull) return target + (sqlOp == "IN" ? " IS NULL" : " IS NOT NULL");
+                // boş liste: IN hiçbir kaydı, NOT IN bütün kayıtları getirir
+                return sqlOp == "IN" ? "1 = 0" : "1 = 1";
+            }
 
             var names = items.Select(x => AddParam(ctx, x)).ToList();
-            return $"{target} {sqlOp} ({string.Join(", ", names)})";
+            string list = $"{target} {sqlOp} ({string.Join(", ", names)})";
+            if (!hasNull) return list;
+            return sqlOp == "IN" ? $"({list} OR {target} IS NULL)" : $"({list} AND {target} IS NOT NULL)";
         }
 
         // ---- yardımcılar
